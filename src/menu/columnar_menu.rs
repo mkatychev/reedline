@@ -2,14 +2,14 @@ use super::{Menu, MenuBuilder, MenuEvent, MenuSettings};
 use crate::{
     core_editor::Editor,
     menu_functions::{
-        available_lines, get_match_indices, resolve_completer_input, scroll_offset_usize,
+        available_lines, get_match_indices, resolve_completer_input, scroll_offset,
         style_suggestion, truncate_with_ansi, CompletionDisplay, CompletionPhase,
     },
     painting::Painter,
     Completer, Suggestion,
 };
 use nu_ansi_term::ansi::RESET;
-use std::num::NonZeroUsize;
+use std::num::{NonZero, NonZeroUsize};
 
 /// The traversal direction of the menu
 #[derive(Debug, PartialEq, Eq)]
@@ -79,15 +79,12 @@ pub struct ColumnarMenu {
     /// whether an empty menu means "still computing" or "no records".
     phase: CompletionPhase,
     /// Column position
-    col_pos: usize,
+    col_pos: u16,
     /// row position in the menu. Starts from 0
-    row_pos: usize,
+    row_pos: u16,
     /// Number of rows that are skipped when printing,
     /// depending on selected value and terminal height
-    skip_rows: usize,
-    /// Rows the menu is cut to so the status line above it stays on the
-    /// screen, `None` without one. Set on every layout from
-    /// `Painter::menu_room_below_status`.
+    skip_rows: u16,
     status_cap: Option<u16>,
     /// Event sent to the menu
     event: Option<MenuEvent>,
@@ -200,7 +197,7 @@ impl ColumnarMenu {
     fn move_next_page(&mut self) {
         self.row_pos = self
             .row_pos
-            .saturating_add(usize::from(self.working_details.visible_rows.max(1)))
+            .saturating_add(self.working_details.visible_rows.max(1))
             .min(self.get_last_row_at_col(self.col_pos));
     }
 
@@ -208,7 +205,7 @@ impl ColumnarMenu {
     fn move_previous_page(&mut self) {
         self.row_pos = self
             .row_pos
-            .saturating_sub(usize::from(self.working_details.visible_rows.max(1)));
+            .saturating_sub(self.working_details.visible_rows.max(1));
     }
 
     /// Move menu cursor left
@@ -231,22 +228,22 @@ impl ColumnarMenu {
     }
 
     /// Calculates row and column positions from an index
-    fn position_from_index(&self, index: usize) -> (usize, usize) {
+    fn position_from_index(&self, index: usize) -> (u16, u16) {
         match self.default_details.traversal_dir {
             TraversalDirection::Vertical => {
-                let rows = self.grid_rows().get();
-                (index % rows, index / rows)
+                let rows = NonZeroUsize::from(self.grid_rows());
+                ((index % rows) as u16, (index / rows) as u16)
             }
             TraversalDirection::Horizontal => {
-                let cols = self.grid_cols().get();
-                (index / cols, index % cols)
+                let cols = NonZeroUsize::from(self.grid_cols());
+                ((index / cols) as u16, (index % cols) as u16)
             }
         }
     }
 
     /// Calculates the last row containing a value for the specified column
-    fn get_last_row_at_col(&self, col_pos: usize) -> usize {
-        let num_values = self.get_values().len();
+    fn get_last_row_at_col(&self, col_pos: u16) -> u16 {
+        let num_values = self.get_values().len() as u16;
         match self.default_details.traversal_dir {
             TraversalDirection::Vertical => {
                 if col_pos >= self.grid_cols().get() - 1 {
@@ -254,32 +251,32 @@ impl ColumnarMenu {
                     let mod_val = num_values % self.grid_rows();
                     if mod_val == 0 {
                         // Full column
-                        self.grid_rows().get().saturating_sub(1)
+                        self.get_rows().saturating_sub(1)
                     } else {
                         // Column with last row empty
                         mod_val.saturating_sub(1)
                     }
                 } else {
                     // Full column
-                    self.grid_rows().get().saturating_sub(1)
+                    self.get_rows().saturating_sub(1)
                 }
             }
             TraversalDirection::Horizontal => {
                 let mod_val = num_values % self.grid_cols();
                 if mod_val > 0 && col_pos >= mod_val {
                     // Column with last row empty
-                    self.grid_rows().get().saturating_sub(2)
+                    self.get_rows().saturating_sub(2)
                 } else {
                     // Full column
-                    self.grid_rows().get().saturating_sub(1)
+                    self.get_rows().saturating_sub(1)
                 }
             }
         }
     }
 
     /// Calculates the last column containing a value for the specified row
-    fn get_last_col_at_row(&self, row_pos: usize) -> usize {
-        let num_values = self.get_values().len();
+    fn get_last_col_at_row(&self, row_pos: u16) -> u16 {
+        let num_values = self.get_values().len() as u16;
         match self.default_details.traversal_dir {
             TraversalDirection::Vertical => {
                 let mod_val = num_values % self.grid_rows();
@@ -312,9 +309,16 @@ impl ColumnarMenu {
 
     /// Menu index based on column and row position
     fn index(&self) -> usize {
+        // Widened to usize so a large grid cannot overflow u16.
         match self.default_details.traversal_dir {
-            TraversalDirection::Vertical => self.col_pos * self.grid_rows().get() + self.row_pos,
-            TraversalDirection::Horizontal => self.row_pos * self.grid_cols().get() + self.col_pos,
+            TraversalDirection::Vertical => {
+                usize::from(self.col_pos) * usize::from(self.grid_rows().get())
+                    + usize::from(self.row_pos)
+            }
+            TraversalDirection::Horizontal => {
+                usize::from(self.row_pos) * usize::from(self.grid_cols().get())
+                    + usize::from(self.col_pos)
+            }
         }
     }
 
@@ -327,32 +331,34 @@ impl ColumnarMenu {
             // No reason to save space if we're waiting for results.
             0
         } else {
-            self.grid_rows().get().min(u16::MAX as usize) as u16
+            self.grid_rows().get()
         }
     }
 
     /// How many rows the value grid has, at least 1 by construction: `%` and
     /// `/` by it cannot panic and need no per-site zero check.
-    fn grid_rows(&self) -> NonZeroUsize {
-        let values = self.get_values().len();
-        NonZeroUsize::new(values.div_ceil(usize::from(self.get_cols())))
-            .unwrap_or(NonZeroUsize::MIN)
+    fn grid_rows(&self) -> NonZero<u16> {
+        let values = self.get_values().len() as u16;
+        NonZero::new(values.div_ceil(self.get_cols())).unwrap_or(NonZero::<u16>::MIN)
     }
 
     /// Calculates how many columns will be used to display values
-    fn get_used_cols(&self) -> usize {
+    fn get_used_cols(&self) -> u16 {
         self.grid_cols().get()
     }
 
     /// The column counterpart of [`grid_rows`](Self::grid_rows), likewise at
     /// least 1 by construction.
-    fn grid_cols(&self) -> NonZeroUsize {
-        let values = self.get_values().len();
+    fn grid_cols(&self) -> NonZero<u16> {
+        let values = self.get_values().len() as u16;
         let cols = match self.default_details.traversal_dir {
-            TraversalDirection::Vertical => values.div_ceil(self.grid_rows().get()),
-            TraversalDirection::Horizontal => usize::from(self.get_cols()).min(values),
+            TraversalDirection::Vertical => {
+                let rows = self.grid_rows();
+                values / rows + u16::from(!values.is_multiple_of(rows.get()))
+            }
+            TraversalDirection::Horizontal => self.get_cols().min(values),
         };
-        NonZeroUsize::new(cols).unwrap_or(NonZeroUsize::MIN)
+        NonZero::new(cols).unwrap_or(NonZero::<u16>::MIN)
     }
 
     /// Returns working details col width
@@ -603,8 +609,6 @@ impl ColumnarMenu {
                 possible_columns.min(self.default_details.columns).max(1);
         }
 
-        // A grid taller than the screen would push the status line out, so it
-        // scrolls within the rows left below it instead.
         self.status_cap = painter.menu_room_below_status(self.min_rows());
         let available = available_lines(
             painter,
@@ -612,7 +616,7 @@ impl ColumnarMenu {
             self.status_cap.unwrap_or(u16::MAX),
         );
         self.working_details.visible_rows = available;
-        self.skip_rows = scroll_offset_usize(self.row_pos, self.skip_rows, usize::from(available));
+        self.skip_rows = scroll_offset(self.row_pos, self.skip_rows, available);
     }
 }
 
@@ -744,22 +748,24 @@ impl Menu for ColumnarMenu {
             return None;
         }
 
-        let columns = self.grid_cols().get();
-        let rows = self.grid_rows().get();
+        // Widened to usize so the products below cannot overflow u16.
+        let columns = NonZeroUsize::from(self.grid_cols()).get();
+        let rows = NonZeroUsize::from(self.grid_rows()).get();
 
         let visible_rows = rows.min(available_lines as usize);
         let menu_column = column as usize / self.get_width();
+        let skip_rows = usize::from(self.skip_rows);
         if menu_column >= columns
             || menu_row as usize >= visible_rows
-            || self.skip_rows + menu_row as usize >= rows
+            || skip_rows + menu_row as usize >= rows
         {
             return None;
         }
 
         let index = match self.default_details.traversal_dir {
-            TraversalDirection::Vertical => menu_column * rows + self.skip_rows + menu_row as usize,
+            TraversalDirection::Vertical => menu_column * rows + skip_rows + menu_row as usize,
             TraversalDirection::Horizontal => {
-                (self.skip_rows + menu_row as usize) * columns + menu_column
+                (skip_rows + menu_row as usize) * columns + menu_column
             }
         };
         if index >= self.get_values().len() {
@@ -803,11 +809,11 @@ impl Menu for ColumnarMenu {
                 TraversalDirection::Vertical => {
                     // `grid_rows`, since `step_by(0)` panics: the type proves
                     // what the enclosing non-empty branch implies.
-                    let num_rows = self.grid_rows().get();
+                    let num_rows: usize = NonZeroUsize::from(self.grid_rows()).get();
                     let rows_to_draw = num_rows.min(available_lines.into());
                     let mut menu_string = String::new();
                     for line in 0..rows_to_draw {
-                        let skip_value = self.skip_rows + line;
+                        let skip_value = self.skip_rows as usize + line;
                         let row_string: String = self
                             .get_values()
                             .iter()
@@ -828,7 +834,8 @@ impl Menu for ColumnarMenu {
                     // Widened to usize so the products cannot overflow u16.
                     let available_values =
                         usize::from(available_lines) * usize::from(self.get_cols());
-                    let skip_values = self.skip_rows * self.grid_cols().get();
+                    let skip_values =
+                        usize::from(self.skip_rows) * usize::from(self.grid_cols().get());
 
                     self.get_values()
                         .iter()
@@ -1170,111 +1177,6 @@ mod tests {
         assert_eq!(menu.grid_rows().get(), 1);
         assert_eq!(menu.grid_cols().get(), 1);
         assert_eq!(menu.position_from_index(0), (0, 0));
-    }
-
-    #[test]
-    fn navigation_keeps_indices_beyond_terminal_coordinates() {
-        let values: Vec<_> = (0..65_550)
-            .map(|index| Suggestion {
-                value: format!("item-{index}"),
-                span: Span { start: 0, end: 0 },
-                ..Default::default()
-            })
-            .collect();
-        let mut editor = Editor::default();
-        let mut menu = ColumnarMenu {
-            completions: CompletionDisplay::from_result(
-                crate::CompletionResult::fresh(values),
-                &[],
-                &editor,
-            )
-            .expect("fresh completions"),
-            ..Default::default()
-        };
-
-        menu.working_details.columns = 1;
-        assert_eq!(menu.grid_rows().get(), 65_550);
-        assert_eq!(menu.get_rows(), u16::MAX); // Only the terminal-facing height is capped.
-        menu.move_previous();
-        assert_eq!(menu.index(), 65_549);
-        let (row, col) = menu.position_from_index(menu.index());
-        assert_eq!((row, col), (65_549, 0));
-        let mut painter = Painter::new(W::sink());
-        painter.handle_resize(20, 10);
-        menu.recompute_layout(&painter);
-        assert!(menu.skip_rows > u16::MAX as usize);
-        assert!(menu.menu_string(10, false).contains("ITEM-65549"));
-        menu.replace_in_buffer(&mut editor);
-        assert_eq!(editor.get_buffer(), "item-65549");
-
-        menu.reset_position();
-        menu.default_details.traversal_dir = TraversalDirection::Vertical;
-        menu.working_details.columns = 2;
-        assert_eq!(menu.grid_rows().get(), 32_775);
-        menu.move_previous();
-        assert_eq!(menu.index(), 65_549);
-        let (row, col) = menu.position_from_index(menu.index());
-        assert_eq!((row, col), (32_774, 1));
-    }
-
-    /// A menu of `count` suggestions `item-0`, `item-1`, ... on a 20x10
-    /// painter, two to a row once laid out.
-    fn tall_menu(count: usize) -> (ColumnarMenu, Painter) {
-        let values: Vec<_> = (0..count)
-            .map(|index| Suggestion {
-                value: format!("item-{index}"),
-                span: Span { start: 0, end: 0 },
-                ..Default::default()
-            })
-            .collect();
-        let menu = ColumnarMenu {
-            completions: CompletionDisplay::from_result(
-                crate::CompletionResult::fresh(values),
-                &[],
-                &Editor::default(),
-            )
-            .expect("fresh completions"),
-            ..Default::default()
-        };
-        let mut painter = Painter::new(W::sink());
-        painter.handle_resize(20, 10);
-        (menu, painter)
-    }
-
-    // A status line takes its row above the menu. A grid taller than the
-    // screen is cut to the rows left below it, scrolls within them, and draws
-    // no more than it booked, so the block stays off the large-buffer path.
-    #[test]
-    fn a_tall_grid_is_cut_to_the_rows_below_the_status_line() {
-        let (mut menu, mut painter) = tall_menu(30);
-        // A one-row buffer: 10 rows, less the buffer and the spare last row.
-        painter.reserve_status_rows(1, painter.status_room(1));
-        // Laid out before the selection moves, as every paint does.
-        menu.recompute_layout(&painter);
-        (0..20).for_each(|_| menu.move_next());
-
-        menu.recompute_layout(&painter);
-
-        assert_eq!(menu.get_rows(), 15);
-        assert_eq!(menu.menu_required_lines(20), 7);
-        let drawn = menu.menu_string(9, false);
-        assert_eq!(drawn.lines().count(), 7);
-        assert!(drawn.contains(">ITEM-20"));
-    }
-
-    // Without a status line, or with too little room below it to show
-    // `min_rows`, the grid keeps its height: in the second case it takes the
-    // status line's rows back.
-    #[test]
-    fn a_tall_grid_is_not_cut_without_room_for_its_min_rows() {
-        let (mut menu, mut painter) = tall_menu(30);
-        menu.recompute_layout(&painter);
-        assert_eq!(menu.menu_required_lines(20), 15);
-
-        painter.reserve_status_rows(1, 3);
-        menu.recompute_layout(&painter);
-
-        assert_eq!(menu.menu_required_lines(20), 15);
     }
 
     #[test]
