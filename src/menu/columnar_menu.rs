@@ -85,6 +85,7 @@ pub struct ColumnarMenu {
     /// Number of rows that are skipped when printing,
     /// depending on selected value and terminal height
     skip_rows: u16,
+    status_cap: Option<u16>,
     /// Event sent to the menu
     event: Option<MenuEvent>,
     /// String collected after the menu is activated
@@ -196,7 +197,7 @@ impl ColumnarMenu {
     fn move_next_page(&mut self) {
         self.row_pos = self
             .row_pos
-            .saturating_add(usize::from(self.working_details.visible_rows.max(1)))
+            .saturating_add(self.working_details.visible_rows.max(1))
             .min(self.get_last_row_at_col(self.col_pos));
     }
 
@@ -204,7 +205,7 @@ impl ColumnarMenu {
     fn move_previous_page(&mut self) {
         self.row_pos = self
             .row_pos
-            .saturating_sub(usize::from(self.working_details.visible_rows.max(1)));
+            .saturating_sub(self.working_details.visible_rows.max(1));
     }
 
     /// Move menu cursor left
@@ -608,7 +609,13 @@ impl ColumnarMenu {
                 possible_columns.min(self.default_details.columns).max(1);
         }
 
-        let available = available_lines(painter, self.min_rows(), u16::MAX);
+        self.status_cap = painter.menu_room_below_status(self.min_rows());
+        let available = available_lines(
+            painter,
+            self.min_rows(),
+            self.status_cap.unwrap_or(u16::MAX),
+        );
+        self.working_details.visible_rows = available;
         self.skip_rows = scroll_offset(self.row_pos, self.skip_rows, available);
     }
 }
@@ -741,22 +748,24 @@ impl Menu for ColumnarMenu {
             return None;
         }
 
-        let columns = self.grid_cols().get();
-        let rows = self.grid_rows().get();
+        // Widened to usize so the products below cannot overflow u16.
+        let columns = NonZeroUsize::from(self.grid_cols()).get();
+        let rows = NonZeroUsize::from(self.grid_rows()).get();
 
         let visible_rows = rows.min(available_lines as usize);
         let menu_column = column as usize / self.get_width();
+        let skip_rows = usize::from(self.skip_rows);
         if menu_column >= columns
             || menu_row as usize >= visible_rows
-            || self.skip_rows + menu_row as usize >= rows
+            || skip_rows + menu_row as usize >= rows
         {
             return None;
         }
 
         let index = match self.default_details.traversal_dir {
-            TraversalDirection::Vertical => menu_column * rows + self.skip_rows + menu_row as usize,
+            TraversalDirection::Vertical => menu_column * rows + skip_rows + menu_row as usize,
             TraversalDirection::Horizontal => {
-                (self.skip_rows + menu_row as usize) * columns + menu_column
+                (skip_rows + menu_row as usize) * columns + menu_column
             }
         };
         if index >= self.get_values().len() {

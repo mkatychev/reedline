@@ -95,6 +95,14 @@ pub enum W {
     /// output-level invariant).
     #[cfg(test)]
     Capture(Vec<u8>),
+    /// Fails once after the given number of bytes, then captures later writes.
+    #[cfg(test)]
+    FailOnce(Vec<u8>, usize, bool),
+    /// Captures like [`W::Capture`], and answers a cursor query from a
+    /// [`TestScreen`] fed on each flush, so the answer reflects what a
+    /// terminal behind a buffered writer has actually received.
+    #[cfg(test)]
+    Screen(Vec<u8>, Box<TestScreen>),
 }
 
 impl W {
@@ -162,6 +170,21 @@ impl Write for W {
             W::Sink(w, _) => w.write(buf),
             #[cfg(test)]
             W::Capture(w) => w.write(buf),
+            #[cfg(test)]
+            W::FailOnce(w, remaining, failed) => {
+                if *failed {
+                    return w.write(buf);
+                }
+                if *remaining == 0 {
+                    *failed = true;
+                    return Err(std::io::Error::other("injected paint failure"));
+                }
+                let written = w.write(&buf[..buf.len().min(*remaining)])?;
+                *remaining -= written;
+                Ok(written)
+            }
+            #[cfg(test)]
+            W::Screen(w, _) => w.write(buf),
         }
     }
 
@@ -172,6 +195,13 @@ impl Write for W {
             W::Sink(w, _) => w.flush(),
             #[cfg(test)]
             W::Capture(w) => w.flush(),
+            #[cfg(test)]
+            W::FailOnce(w, ..) => w.flush(),
+            #[cfg(test)]
+            W::Screen(w, screen) => {
+                screen.sync(w);
+                Ok(())
+            }
         }
     }
 }
@@ -193,6 +223,18 @@ impl W {
             }
             #[cfg(test)]
             W::Capture(_) => Err(std::io::Error::other("no terminal attached")),
+            #[cfg(test)]
+            W::FailOnce(..) => Err(std::io::Error::other("no terminal attached")),
+            #[cfg(test)]
+            W::Screen(_, screen) => {
+                // A real terminal would answer this only at its timeout, a
+                // stall rather than a wrong answer, so fail the test outright.
+                assert!(
+                    !screen.frame_open(),
+                    "cursor query sent inside a synchronized update"
+                );
+                Ok(screen.reported_cursor())
+            }
         }
     }
 }
@@ -962,7 +1004,7 @@ impl Painter {
         let anchor_row = self.prompt_start_row.last_known_row();
         self.clear_from_anchor(anchor_row)?;
 
-        let layout = self.compute_layout(lines, menu);
+        let layout = self.compute_layout(lines, menu, block_rows, status_rows);
 
         let margin_cursor_row = if self.large_buffer {
             self.print_large_buffer(prompt, lines, menu, use_ansi_coloring, &layout)?
